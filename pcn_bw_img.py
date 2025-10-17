@@ -1,6 +1,5 @@
-# pcn_bw_images.py
-import os
-import glob
+# pcn_coco8_gray_patches.py
+import os, glob
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -36,10 +35,10 @@ class PredictiveCodingNet:
         x_dim,
         r1_dim,
         r2_dim,
-        eta_r=0.2,          # inference step
+        eta_r=0.25,         # inference step size
         eta_w=1e-3,         # weight learning step
         l2_act=1e-3,        # small L2 on activations
-        inference_steps=60, # iterations per input
+        inference_steps=80, # iterations per input
         seed=0
     ):
         rng = np.random.default_rng(seed)
@@ -53,31 +52,45 @@ class PredictiveCodingNet:
         self.l2_act = l2_act
         self.inference_steps = inference_steps
 
-    def infer(self, x, r1_init=None, r2_init=None):
+    def infer(self, x, r1_init=None, r2_init=None, record=False):
+        """
+        Run inference to estimate r1, r2.
+        If record=True, also store reconstructions (U1 @ r1) at each time step.
+        Returns:
+        	r1, r2, e0, e1, reconstructions (list or None)
+        """
         r1 = np.zeros(self.r1_dim) if r1_init is None else r1_init.copy()
         r2 = np.zeros(self.r2_dim) if r2_init is None else r2_init.copy()
-
-        for _ in range(self.inference_steps):
-            z2   = self.U2 @ r2           # pre-activation at level-1 (from level-2)
-            r1td = f(z2)                  # top-down prediction for r1
-
-            e0 = x - self.U1 @ r1         # pixel-level error
-            e1 = r1 - r1td                # level-1 error
-
-            # activation updates
-            r1 += self.eta_r * (self.U1.T @ e0 - e1 - self.l2_act * r1)
-            r2 += self.eta_r * (self.U2.T @ (fprime(z2) * e1) - self.l2_act * r2)
-
-        # final compute
+     
+        recons = [] if record else None
+     
+        for t in range(self.inference_steps):
+        	z2   = self.U2 @ r2
+        	r1td = f(z2)
+     
+        	e0 = x - self.U1 @ r1
+        	e1 = r1 - r1td
+     
+        	# activation updates
+        	r1 += self.eta_r * (self.U1.T @ e0 - e1 - self.l2_act * r1)
+        	r2 += self.eta_r * (self.U2.T @ (fprime(z2) * e1) - self.l2_act * r2)
+     
+        	if record:
+        		recons.append(self.U1 @ r1)  # predicted image at this time step
+     
         z2   = self.U2 @ r2
         r1td = f(z2)
         e0 = x - self.U1 @ r1
         e1 = r1 - r1td
-        return r1, r2, e0, e1
+     
+        if record:
+        	return r1, r2, e0, e1, recons
+        else:
+        	return r1, r2, e0, e1
 
     def learn(self, x, r1=None, r2=None):
         r1, r2, e0, e1 = self.infer(x, r1, r2)
-        # weight updates (simple local rules)
+        # weight updates (local rules)
         self.U1 += self.eta_w * np.outer(e0, r1)
         self.U2 += self.eta_w * np.outer(fprime(self.U2 @ r2) * e1, r2)
 
@@ -92,52 +105,86 @@ class PredictiveCodingNet:
         return self.U1 @ r1
 
 # ----------------------------
-# Image loading / preprocessing
+# Data: load grayscale + extract patches
 # ----------------------------
-def load_bw_images(
-    root_dir="./data/bw",
-    img_size=8,
-    binarize=True,
-    threshold=0.5,
-    max_images=None
-):
-    """
-    Loads images (PNG/JPG) from root_dir (recursively), converts to grayscale,
-    resizes to img_size x img_size, optionally binarizes, and maps to [-1, 1].
-    Returns array X of shape [N, img_size*img_size].
-    """
-    exts = ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.gif")
+def list_images(root):
+    exts = (".jpg", ".jpeg", ".png", ".bmp")
     files = []
-    for ext in exts:
-        files.extend(glob.glob(os.path.join(root_dir, "**", ext), recursive=True))
-    files = sorted(files)
+    for split in ("train", "val"):
+        d = os.path.join(root, "images", split)
+        for fn in sorted(glob.glob(os.path.join(d, "*"))):
+            if os.path.splitext(fn)[1].lower() in exts:
+                files.append(fn)
+    if not files:
+        raise FileNotFoundError(f"No images found under {root}/images/{{train,val}}")
+    return files
+
+def load_gray(path):
+    # load as grayscale float32 in [0,1]
+    im = Image.open(path).convert("L")
+    arr = np.asarray(im, dtype=np.float32) / 255.0
+    return arr  # HxW
+
+def extract_patches(img, patch_size=16, stride=8, max_patches=None, rng=None):
+    """
+    img: HxW in [0,1]
+    returns: [N, patch_size*patch_size] mapped to [-1,1]
+    """
+    H, W = img.shape
+    ps = patch_size
+    patches = []
+    for y in range(0, H - ps + 1, stride):
+        for x in range(0, W - ps + 1, stride):
+            p = img[y:y+ps, x:x+ps]
+            patches.append(p)
+    if not patches:
+        # if image smaller than patch, resize and take one patch
+        p = np.array(Image.fromarray((img*255).astype(np.uint8)).resize((ps, ps), Image.BICUBIC)) / 255.0
+        patches = [p]
+
+    patches = np.stack(patches, axis=0)
+
+    if max_patches is not None and len(patches) > max_patches:
+        rng = np.random.default_rng(0) if rng is None else rng
+        idx = rng.choice(len(patches), size=max_patches, replace=False)
+        patches = patches[idx]
+
+    # map to [-1,1] for tanh
+    patches = patches * 2.0 - 1.0
+    patches = patches.reshape(len(patches), ps*ps)
+    return patches
+
+def build_patch_dataset(
+    coco8_root="coco8-grayscale",
+    patch_size=16,
+    stride=8,
+    max_images=None,
+    max_patches_per_image=128,
+):
+    files = list_images(coco8_root)
     if max_images is not None:
         files = files[:max_images]
-    if not files:
-        raise FileNotFoundError(
-            f"No images found in {root_dir}. Put a few BW/grayscale images there."
-        )
 
-    X = []
+    all_patches = []
+    rng = np.random.default_rng(123)
     for fp in files:
-        img = Image.open(fp).convert("L")                 # grayscale 0..255
-        img = img.resize((img_size, img_size), Image.BICUBIC)
-        arr = np.asarray(img, dtype=np.float32) / 255.0   # to [0,1]
+        img = load_gray(fp)          # HxW in [0,1]
+        patches = extract_patches(
+            img,
+            patch_size=patch_size,
+            stride=stride,
+            max_patches=max_patches_per_image,
+            rng=rng
+        )
+        all_patches.append(patches)
 
-        if binarize:
-            arr = (arr > threshold).astype(np.float32)
-
-        # map to [-1, 1] (helps with tanh)
-        arr = arr * 2.0 - 1.0
-        X.append(arr.flatten())
-
-    X = np.stack(X, axis=0)
-    return X
+    X = np.concatenate(all_patches, axis=0)
+    return X  # [N, patch_size*patch_size]
 
 # ----------------------------
 # Visualization helpers
 # ----------------------------
-def show_basis(U1, img_size=8, num=16, title="Level-1 basis (columns of U1)"):
+def show_basis(U1, img_size=16, num=25, title="Level-1 basis (columns of U1)"):
     num = min(num, U1.shape[1])
     cols = int(np.ceil(np.sqrt(num)))
     rows = int(np.ceil(num / cols))
@@ -145,23 +192,22 @@ def show_basis(U1, img_size=8, num=16, title="Level-1 basis (columns of U1)"):
     plt.figure(figsize=(1.6*cols, 1.6*rows))
     for i in range(num):
         plt.subplot(rows, cols, i+1)
-        # each column is a basis vector in pixel space
         patch = U1[:, i].reshape(img_size, img_size)
-        # rescale to [0,1] for display
         pmin, pmax = patch.min(), patch.max()
-        if pmax > pmin:
-            patch_disp = (patch - pmin) / (pmax - pmin)
-        else:
-            patch_disp = np.zeros_like(patch)
+        patch_disp = (patch - pmin) / (pmax - pmin + 1e-8)
         plt.imshow(patch_disp, cmap="gray", interpolation="nearest")
         plt.axis("off")
     plt.suptitle(title)
     plt.tight_layout()
     plt.show()
 
-def show_reconstructions(X, net, img_size=8, k=6):
+def show_reconstructions(X, net, img_size=16, k=6):
     k = min(k, len(X))
     idx = np.random.default_rng(0).choice(len(X), size=k, replace=False)
+
+    def to01(v):
+        v = (v + 1.0) / 2.0
+        return np.clip(v, 0.0, 1.0)
 
     plt.figure(figsize=(8, 2*k))
     for i, j in enumerate(idx):
@@ -169,17 +215,12 @@ def show_reconstructions(X, net, img_size=8, k=6):
         r1, r2, _, _ = net.infer(x)
         x_hat = net.reconstruct(r1)
 
-        # back to [0,1] from [-1,1]
-        def to01(v):
-            v = (v + 1.0) / 2.0
-            return np.clip(v, 0.0, 1.0)
-
         x_img     = to01(x).reshape(img_size, img_size)
         xhat_img  = to01(x_hat).reshape(img_size, img_size)
 
         plt.subplot(k, 2, 2*i+1)
         plt.imshow(x_img, cmap="gray", interpolation="nearest")
-        plt.title("Original")
+        plt.title("Original patch")
         plt.axis("off")
 
         plt.subplot(k, 2, 2*i+2)
@@ -190,23 +231,50 @@ def show_reconstructions(X, net, img_size=8, k=6):
     plt.tight_layout()
     plt.show()
 
+def show_timecourse(x, recons, img_size=16, step_stride=5):
+    """
+    Display the input and several reconstruction frames along the inference trajectory.
+    """
+    def to01(v):  # map [-1,1] to [0,1]
+        v = (v + 1.0) / 2.0
+        return np.clip(v, 0, 1)
+
+    steps = list(range(0, len(recons), step_stride)) + [len(recons)-1]
+    cols = len(steps) + 1
+
+    plt.figure(figsize=(2*cols, 2))
+    plt.subplot(1, cols, 1)
+    plt.imshow(to01(x).reshape(img_size, img_size), cmap="gray")
+    plt.title("Input")
+    plt.axis("off")
+
+    for i, t in enumerate(steps):
+        plt.subplot(1, cols, i+2)
+        plt.imshow(to01(recons[t]).reshape(img_size, img_size), cmap="gray")
+        plt.title(f"t={t}")
+        plt.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+
 # ----------------------------
 # Train loop
 # ----------------------------
-def train_on_images(
+def train_on_patches(
     X,
-    img_size=8,
-    r1_dim=32,
-    r2_dim=16,
-    epochs=20,
-    eta_r=0.2,
+    patch_size=16,
+    r1_dim=128,
+    r2_dim=64,
+    epochs=15,
+    eta_r=0.25,
     eta_w=1e-3,
     l2_act=1e-3,
-    inference_steps=60,
-    batch_size=64,
+    inference_steps=80,
+    batch_size=256,
     seed=1
 ):
-    x_dim = img_size * img_size
+    x_dim = patch_size * patch_size
     net = PredictiveCodingNet(
         x_dim=x_dim, r1_dim=r1_dim, r2_dim=r2_dim,
         eta_r=eta_r, eta_w=eta_w, l2_act=l2_act,
@@ -233,37 +301,39 @@ def train_on_images(
 # Main
 # ----------------------------
 if __name__ == "__main__":
-    # --- user knobs ---
-    IMG_SIZE   = 16     # try 8 or 16; higher is harder
-    BINARIZE   = True   # for crisp black/white
-    THRESH     = 0.5    # binarization threshold in [0,1]
-    MAX_IMAGES = None   # or an int like 500
+    # ---- paths & patching ----
+    COCO8_ROOT = "coco8-grayscale"  # expects images/train and images/val
+    PATCH_SIZE = 16                 # try 8 or 16
+    STRIDE     = 8                  # overlap controls variety
+    MAX_IMAGES = None               # e.g., 32 if you want to limit
+    MAX_PATCHES_PER_IMAGE = 128     # cap for speed
 
-    # model sizes: scale roughly with IMG_SIZE
-    R1_DIM = 64         # level-1 features (try 2-4x IMG_SIZE)
-    R2_DIM = 32         # level-2 causes (try ~half of R1_DIM)
+    # ---- model sizes (scale with patch size) ----
+    R1_DIM = 128
+    R2_DIM = 64
 
-    # training knobs
-    EPOCHS     = 20
-    INFER_STEPS= 80
-    ETA_R      = 0.25
-    ETA_W      = 1e-3
-    L2_ACT     = 1e-3
-    BATCH_SIZE = 64
+    # ---- training knobs ----
+    EPOCHS       = 15
+    INFER_STEPS  = 80
+    ETA_R        = 0.25
+    ETA_W        = 1e-3
+    L2_ACT       = 1e-3
+    BATCH_SIZE   = 256
 
-    # 1) Load images
-    X = load_bw_images(
-        root_dir="./data/bw",
-        img_size=IMG_SIZE,
-        binarize=BINARIZE,
-        threshold=THRESH,
-        max_images=MAX_IMAGES
+    print("Building patch dataset from COCO8 grayscale ...")
+    X = build_patch_dataset(
+        coco8_root=COCO8_ROOT,
+        patch_size=PATCH_SIZE,
+        stride=STRIDE,
+        max_images=MAX_IMAGES,
+        max_patches_per_image=MAX_PATCHES_PER_IMAGE
     )
+    print(f"Total patches: {len(X)} | patch dim: {PATCH_SIZE*PATCH_SIZE}")
 
-    # 2) Train the predictive-coding model
-    net = train_on_images(
+    print("Training predictive-coding model ...")
+    net = train_on_patches(
         X,
-        img_size=IMG_SIZE,
+        patch_size=PATCH_SIZE,
         r1_dim=R1_DIM,
         r2_dim=R2_DIM,
         epochs=EPOCHS,
@@ -275,10 +345,11 @@ if __name__ == "__main__":
         seed=1
     )
 
-    # 3) Visualize level-1 basis vectors (columns of U1)
-    show_basis(net.U1, img_size=IMG_SIZE, num=min(36, R1_DIM),
-               title="Level-1 basis (U1 columns)")
+    # Visualize learned bases & a few reconstructions
+    show_basis(net.U1, img_size=PATCH_SIZE, num=min(36, R1_DIM),
+               title="Level-1 basis (U1 columns) — COCO8 patches")
+    show_reconstructions(X, net, img_size=PATCH_SIZE, k=6)
 
-    # 4) Show a few reconstructions
-    show_reconstructions(X, net, img_size=IMG_SIZE, k=6)
-
+    x = X[0]  # pick a patch
+    r1, r2, e0, e1, recons = net.infer(x, record=True)
+    show_timecourse(x, recons, img_size=PATCH_SIZE, step_stride=10)
